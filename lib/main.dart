@@ -32,10 +32,10 @@ class DrowsinessDetection extends StatefulWidget {
   const DrowsinessDetection({super.key, required this.cameras});
 
   @override
-  _DrowsinessDetectionState createState() => _DrowsinessDetectionState();
+  DrowsinessDetectionState createState() => DrowsinessDetectionState();
 }
 
-class _DrowsinessDetectionState extends State<DrowsinessDetection> {
+class DrowsinessDetectionState extends State<DrowsinessDetection> {
   late CameraController _controller;
   bool isProcessing = false;
   final audioPlayer = AudioPlayer();
@@ -43,11 +43,13 @@ class _DrowsinessDetectionState extends State<DrowsinessDetection> {
 
   // 이미지 처리를 위한 버퍼
   List<List<List<double>>>? _inputBuffer;
+  // 수정된 출력 버퍼 (softmax 출력을 위해 2개의 클래스)
+  final List<double> _outputBuffer = List.filled(2, 0.0);
 
   // 졸음 감지를 위한 상태 변수들
   int drowsyFrameCount = 0;
-  static const int DROWSY_FRAME_THRESHOLD = 20;
-  static const double DROWSY_THRESHOLD = 0.7;
+  static const int drowsyFrameThreshold = 15;
+
   DateTime? lastAlertTime;
 
   @override
@@ -89,13 +91,16 @@ class _DrowsinessDetectionState extends State<DrowsinessDetection> {
   Future<void> _loadModel() async {
     try {
       final options = InterpreterOptions()..threads = 4; // 멀티스레딩 활성화
-      // ..useNnapi = true; // Android Neural Networks API 사용
+      //..useNnapi = true; // Android Neural Networks API 사용  텐서플로우2.2이상부터 우린 2.14...
 
       _interpreter = await Interpreter.fromAsset(
-        'assets/converted_jt_model.tflite',
+        'assets/train_jt_merged_mov2.tflite', //  그나마 조음
+        // 'assets/train_merged_mov2.tflite',//  별로
+        // 'assets/train_merged_cnn_light.tflite',// 구림
         options: options,
       );
     } catch (e) {
+      // ignore: avoid_print
       print('Error loading model: $e');
     }
   }
@@ -109,7 +114,7 @@ class _DrowsinessDetectionState extends State<DrowsinessDetection> {
       final int height = image.height;
       final int uvRowStride = image.planes[1].bytesPerRow;
       final int uvPixelStride = image.planes[1].bytesPerPixel!;
-
+      //a
       // YUV420 형식의 카메라 이미지를 RGB로 변환하고 224x224 크기로 리샘플링
       for (int x = 0; x < 224; x++) {
         for (int y = 0; y < 224; y++) {
@@ -142,23 +147,29 @@ class _DrowsinessDetectionState extends State<DrowsinessDetection> {
 
       // 모델 실행을 위한 입력 준비
       final input = [_inputBuffer!];
-      final output = List.filled(1, 0.0).reshape([1, 1]); // 이진분류
+      // softmax 출력을 위한 shape 수정 [1, 2]
+      final output = [_outputBuffer];
 
       // 모델 실행
       _interpreter!.run(input, output);
 
-      // 결과 처리
-      final isEyeClosed = output[0] > 0.5;
-
+      // softmax 출력 처리
+      // label.txt = [close, open]
+      // output[0][0]은 눈 감은 상태의 확률
+      // output[0][1]은 눈 뜬 상태의 확률
+      final isEyeClosed = output[0][0] > output[0][1]; // 눈 감은 확률이 더 높은 경우
+      print('close, ${output[0][0]}');
+      print('open, ${output[0][1]}');
       if (isEyeClosed) {
         drowsyFrameCount++;
-        if (drowsyFrameCount >= DROWSY_FRAME_THRESHOLD) {
+        if (drowsyFrameCount >= drowsyFrameThreshold) {
           _handleDrowsiness();
         }
       } else {
         drowsyFrameCount = 0;
       }
     } catch (e) {
+      // ignore: avoid_print
       print('Error processing image: $e');
     } finally {
       isProcessing = false;
@@ -236,9 +247,9 @@ class _DrowsinessDetectionState extends State<DrowsinessDetection> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Text('눈 감김 확률: ${(output[0] * 100).toStringAsFixed(1)}%'),
+            Text('눈 감은 상태 확률: ${(_outputBuffer[0] * 100).toStringAsFixed(1)}%'),
+            Text('눈 뜬 상태 확률: ${(_outputBuffer[1] * 100).toStringAsFixed(1)}%'),
             Text('연속 프레임: $drowsyFrameCount'),
-            Text('임계값: ${(DROWSY_THRESHOLD * 100).toStringAsFixed(1)}%'),
             const Text('알림 간격: 5초'),
             Text('마지막 알림: ${lastAlertTime?.toString() ?? "없음"}'),
           ],

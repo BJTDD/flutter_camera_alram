@@ -58,6 +58,10 @@ flutter:
   assets:
     - assets/alert.wav
     - assets/converted_model.tflite
+    - assets/train_jt_merged_mov2.tflite
+    - assets/train_merged_mov2.tflite
+    - assets/train_merged_cnn_light.tflite
+    
     - assets/label.txt
   # The following line ensures that the Material Icons font is
   # included with your application, so that you can use the icons in
