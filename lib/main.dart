@@ -4,6 +4,13 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart'
+    as mlkit;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:platform/platform.dart';
+import 'package:google_mlkit_commons/google_mlkit_commons.dart';
+import 'package:google_ml_vision/google_ml_vision.dart';
 
 void main() async {
   // Flutter 엔진 초기화
@@ -66,6 +73,7 @@ class DrowsinessDetectionState extends State<DrowsinessDetection>
   Interpreter? _interpreter;
   DateTime? lastProcessedTime;
 
+  late mlkit.FaceDetector _faceDetector;
   // 성능 최적화를 위한 상수들
   static const Duration processInterval =
       Duration(milliseconds: 100); // 디바이스 성능에 따라 적절히 조절
@@ -81,6 +89,14 @@ class DrowsinessDetectionState extends State<DrowsinessDetection>
   static const int drowsyFrameThreshold = 10;
   DateTime? lastAlertTime;
   bool isProcessing = false; // 프레임 처리 중복 방지
+  late Platform platform;
+  // 디바이스 방향에 따른 회전 매핑
+  final _orientations = {
+    DeviceOrientation.portraitUp: 0,
+    DeviceOrientation.landscapeLeft: 90,
+    DeviceOrientation.portraitDown: 180,
+    DeviceOrientation.landscapeRight: 270,
+  };
 
   @override
   void initState() {
@@ -89,6 +105,15 @@ class DrowsinessDetectionState extends State<DrowsinessDetection>
     _initializeCamera(); // 카메라 초기화
     _loadModel(); // AI 모델 로드
     _initializeBuffers(); // 입력 버퍼 초기화
+    _initializeFaceDetector();
+  }
+
+  void _initializeFaceDetector() {
+    final options = mlkit.FaceDetectorOptions(
+      enableLandmarks: true,
+      performanceMode: mlkit.FaceDetectorMode.fast,
+    );
+    _faceDetector = mlkit.FaceDetector(options: options);
   }
 
   void _initializeBuffers() {
@@ -110,29 +135,62 @@ class DrowsinessDetectionState extends State<DrowsinessDetection>
         widget.cameras[1], // 전면 카메라 선택 (index 1)
         ResolutionPreset.low, // 저해상도
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420,
-        fps: 20, // 초당 프레임 수 제한
+
+        imageFormatGroup: platform.isAndroid
+            ? ImageFormatGroup.nv21 // Android용 이미지 포맷
+            : ImageFormatGroup.bgra8888, // iOS용 이미지 포맷
       );
       await _controller.initialize();
+      await _controller.startImageStream(_processCameraImage);
 
-      // 무한 루프. 카메라로 부터 실시간 이미지 스트림 받아옴
-      await _controller.startImageStream((CameraImage image) {
-        final now = DateTime.now();
-        // 프레임 처리 간격 및 중복 처리 체크
-        if (!isProcessing && lastProcessedTime == null ||
-            now.difference(lastProcessedTime!) >= processInterval) {
-          isProcessing = true;
-          lastProcessedTime = now;
-          _processCameraImage(image).then((_) {
-            // 이미지 처리 시작
-            isProcessing = false;
-          });
-        }
-      });
       setState(() {});
     } on CameraException catch (e) {
       print('카메라 초기화 오류: $e');
     }
+  }
+
+  InputImage? _inputImageFromCameraImage(CameraImage image) {
+    final camera = widget.cameras[1];
+    final sensorOrientation = camera.sensorOrientation;
+
+    InputImageRotation? rotation;
+    if (platform.isIOS) {
+      rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
+    } else if (platform.isAndroid) {
+      var rotationCompensation =
+          _orientations[_controller.value.deviceOrientation];
+      if (rotationCompensation == null) return null;
+
+      if (camera.lensDirection == CameraLensDirection.front) {
+        // 전면 카메라
+        rotationCompensation = (sensorOrientation + rotationCompensation) % 360;
+      } else {
+        // 후면 카메라
+        rotationCompensation =
+            (sensorOrientation - rotationCompensation + 360) % 360;
+      }
+      rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
+    }
+    if (rotation == null) return null;
+    // 이미지 포맷 설정
+    final format = platform.isAndroid
+        ? InputImageFormat.nv21 // Android
+        : InputImageFormat.bgra8888; // iOS
+
+    // 이미지 평면이 하나만 있는지 확인
+    if (image.planes.length != 1) return null;
+    final plane = image.planes.first;
+
+    // InputImage 생성
+    return InputImage.fromBytes(
+      bytes: plane.bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: plane.bytesPerRow,
+      ),
+    );
   }
 
   Future<void> _loadModel() async {
@@ -147,16 +205,6 @@ class DrowsinessDetectionState extends State<DrowsinessDetection>
         // 'assets/train_merged_cnn_light.tflite',// 구림
         options: options,
       );
-
-      print('Input Tensor Shape: ${_interpreter!.getInputTensor(0).shape}');
-      print('Output Tensor Shape: ${_interpreter!.getOutputTensor(0).shape}');
-      print('Input Tensor Type: ${_interpreter!.getInputTensor(0).type}');
-      print('Output Tensor Type: ${_interpreter!.getOutputTensor(0).type}');
-      // 입력 데이터 형식 확인
-      final inputTensor = _interpreter!.getInputTensor(0);
-      final outputTensor = _interpreter!.getOutputTensor(0);
-      print('Input Tensor Details: ${inputTensor.toString()}');
-      print('Output Tensor Details: ${outputTensor.toString()}');
     } catch (e) {
       // ignore: avoid_print
       print('모델 로드 오류: $e');
@@ -169,178 +217,169 @@ class DrowsinessDetectionState extends State<DrowsinessDetection>
     if (_interpreter == null) return;
 
     try {
-      // 이미지 전처리
-      final int width = image.width;
-      final int height = image.height;
-      final int uvRowStride = image.planes[1].bytesPerRow;
-      final int uvPixelStride = image.planes[1].bytesPerPixel!;
+      final inputImage = _inputImageFromCameraImage(image);
+      if (inputImage == null) return;
 
-      // YUV to RGB 변환을 위한 임시 버퍼
-      List<List<List<int>>> rgbBuffer = List.generate(
-        modelInputSize,
+      // 얼굴 검출
+      final faces = await _faceDetector.processImage(inputImage);
+      if (faces.isEmpty) return;
+
+      // 나머지 처리 로직...
+      final face = faces.first;
+      final leftEye = face.landmarks[FaceLandmarkType.leftEye];
+      final rightEye = face.landmarks[FaceLandmarkType.rightEye];
+
+      if (leftEye == null || rightEye == null) return;
+
+      // 눈 영역 추출 및 처리...
+      final leftEyeImage = _extractEyeRegion(image, leftEye);
+      final rightEyeImage = _extractEyeRegion(image, rightEye);
+
+      final leftEyeResult = await _runInference(leftEyeImage);
+      final rightEyeResult = await _runInference(rightEyeImage);
+
+      final isEyesClosed = leftEyeResult[0] > 0.5 && rightEyeResult[0] > 0.5;
+
+      if (mounted) {
+        setState(() {
+          if (isEyesClosed) {
+            drowsyFrameCount++;
+            if (drowsyFrameCount >= drowsyFrameThreshold) {
+              _handleDrowsiness();
+            }
+          } else {
+            drowsyFrameCount = max(0, drowsyFrameCount - 2);
+          }
+        });
+      }
+    } catch (e) {
+      print('프레임 처리 오류: $e');
+    }
+  }
+
+  List<List<List<double>>> _extractEyeRegion(
+      CameraImage image, mlkit.FaceLandmark eye) {
+    try {
+      // 모델 입력 크기
+      const int targetSize = 160;
+
+      // 눈 영역 주변의 패딩 (픽셀)
+      const int eyePadding = 10;
+
+      // 눈 위치 계산 (카메라 이미지 크기에 맞게 스케일링)
+      int centerX = (eye.position.x * image.width).toInt();
+      int centerY = (eye.position.y * image.height).toInt();
+
+      // 눈 영역의 바운딩 박스 계산
+      int startX = max(0, centerX - targetSize ~/ 4 - eyePadding);
+      int startY = max(0, centerY - targetSize ~/ 4 - eyePadding);
+      int endX = min(image.width - 1, centerX + targetSize ~/ 4 + eyePadding);
+      int endY = min(image.height - 1, centerY + targetSize ~/ 4 + eyePadding);
+
+      // 결과 버퍼 초기화 (160x160x3)
+      List<List<List<double>>> eyeBuffer = List.generate(
+        targetSize,
         (_) => List.generate(
-          modelInputSize,
-          (_) => List.filled(3, 0),
+          targetSize,
+          (_) => List.filled(3, 0.0),
           growable: false,
         ),
         growable: false,
       );
 
-      // YUV420 to RGB 변환 및 크기 조정
-      for (int x = 0; x < modelInputSize; x++) {
-        for (int y = 0; y < modelInputSize; y++) {
-          // int sourceX = (x * width ~/ modelInputSize);
-          // int sourceY = (y * height ~/ modelInputSize);
-          // 이미지 뒤집기 (전면 카메라 미러링 처리)
-          int sourceX = width - 1 - (x * width ~/ modelInputSize);
-          int sourceY = (y * height ~/ modelInputSize);
-          // // 이미지 중앙 부분에 집중
-          // int sourceX = (x * width ~/ modelInputSize);
-          // int sourceY = (y * height ~/ modelInputSize);
+      // YUV420 이미지에서 RGB 추출 및 리사이징
+      final int uvRowStride = image.planes[1].bytesPerRow;
+      final int uvPixelStride = image.planes[1].bytesPerPixel!;
 
-          final int uvIndex =
-              uvPixelStride * (sourceX ~/ 2) + uvRowStride * (sourceY ~/ 2);
-          final int index = sourceY * width + sourceX;
+      // 실제 눈 영역의 크기
+      final int eyeWidth = endX - startX;
+      final int eyeHeight = endY - startY;
 
-          // // YUV 값 추출
-          // final yp = image.planes[0].bytes[index];
-          // final up = image.planes[1].bytes[uvIndex];
-          // final vp = image.planes[2].bytes[uvIndex];
+      // 스케일 팩터 계산
+      final double scaleX = eyeWidth / targetSize;
+      final double scaleY = eyeHeight / targetSize;
+
+      // 타겟 이미지로 리샘플링
+      for (int y = 0; y < targetSize; y++) {
+        for (int x = 0; x < targetSize; x++) {
+          // 원본 이미지에서의 위치 계산
+          int sourceX = (startX + (x * scaleX)).toInt();
+          int sourceY = (startY + (y * scaleY)).toInt();
 
           // YUV 값 추출
+          final int uvIndex =
+              uvPixelStride * (sourceX ~/ 2) + uvRowStride * (sourceY ~/ 2);
+          final int index = sourceY * image.width + sourceX;
+
+          // YUV to RGB 변환
           int yp = image.planes[0].bytes[index] & 0xFF;
           int up = image.planes[1].bytes[uvIndex] & 0xFF;
           int vp = image.planes[2].bytes[uvIndex] & 0xFF;
 
-          // BT.601 변환 공식 적용
+          // YUV -> RGB 변환 (BT.601 표준)
           int y1 = yp;
           int u = up - 128;
           int v = vp - 128;
 
-          // RGB 변환 (정수 연산으로 최적화)
+          // RGB 계산 (최적화된 정수 연산)
           int r = y1 + ((1402 * v) >> 10);
           int g = y1 - ((344 * u + 714 * v) >> 10);
           int b = y1 + ((1772 * u) >> 10);
 
-          // RGB 값 클램핑
-          rgbBuffer[y][x][0] = r.clamp(0, 255);
-          rgbBuffer[y][x][1] = g.clamp(0, 255);
-          rgbBuffer[y][x][2] = b.clamp(0, 255);
+          // 값 범위 제한
+          r = r.clamp(0, 255);
+          g = g.clamp(0, 255);
+          b = b.clamp(0, 255);
 
-          // // YUV to RGB 변환
-          // int r = (yp + 1.402 * (vp - 128)).round().clamp(0, 255);
-          // int g = (yp - 0.344136 * (up - 128) - 0.714136 * (vp - 128))
-          //     .round()
-          //     .clamp(0, 255);
-          // int b = (yp + 1.772 * (up - 128)).round().clamp(0, 255);
-
-          // // 이미지 정규화 (-1 ~ 1 범위로) (모델 전처리에 맞춤):
-          // _inputBuffer[y][x][0] = (r / 127.5) - 1;
-          // _inputBuffer[y][x][1] = (g / 127.5) - 1;
-          // _inputBuffer[y][x][2] = (b / 127.5) - 1;
+          // MobileNetV2 전처리 (-1 ~ 1 범위로 정규화)
+          eyeBuffer[y][x][0] = (r / 127.5) - 1.0; // R
+          eyeBuffer[y][x][1] = (g / 127.5) - 1.0; // G
+          eyeBuffer[y][x][2] = (b / 127.5) - 1.0; // B
         }
       }
 
-      // 정규화 전 RGB 통계
-      List<double> means = List.filled(3, 0.0);
-      List<double> maxVals = List.filled(3, 0.0);
-      List<double> minVals = List.filled(3, 255.0);
+      // 디버깅을 위한 통계 출력
 
-      for (int y = 0; y < modelInputSize; y++) {
-        for (int x = 0; x < modelInputSize; x++) {
-          for (int c = 0; c < 3; c++) {
-            means[c] += rgbBuffer[y][x][c];
-            maxVals[c] = max(maxVals[c], rgbBuffer[y][x][c].toDouble());
-            minVals[c] = min(minVals[c], rgbBuffer[y][x][c].toDouble());
-          }
-        }
-      }
-
-      for (int c = 0; c < 3; c++) {
-        means[c] /= (modelInputSize * modelInputSize);
-      }
-
-      print('RGB Statistics:');
-      for (int c = 0; c < 3; c++) {
-        print(
-            'Channel $c - Min: ${minVals[c]}, Max: ${maxVals[c]}, Mean: ${means[c]}');
-      }
-
-      // MobileNetV2 정규화 적용 (1/127.5 - 1)
-      for (int y = 0; y < modelInputSize; y++) {
-        for (int x = 0; x < modelInputSize; x++) {
-          for (int c = 0; c < 3; c++) {
-            _inputBuffer[y][x][c] = (rgbBuffer[y][x][c] / 127.5) - 1.0;
-          }
-        }
-      }
-
-      // 모델 실행 전 입력 데이터 확인
-      double inputMin = double.infinity;
-      double inputMax = double.negativeInfinity;
-      double inputSum = 0;
+      double minVal = double.infinity;
+      double maxVal = double.negativeInfinity;
+      double sum = 0;
       int count = 0;
 
-      for (var row in _inputBuffer) {
+      for (var row in eyeBuffer) {
         for (var pixel in row) {
           for (var value in pixel) {
-            inputMin = min(inputMin, value);
-            inputMax = max(inputMax, value);
-            inputSum += value;
+            minVal = min(minVal, value);
+            maxVal = max(maxVal, value);
+            sum += value;
             count++;
           }
         }
       }
 
-      print('Normalized input statistics:');
-      print('Min: $inputMin');
-      print('Max: $inputMax');
-      print('Mean: ${inputSum / count}');
+      print('Eye region statistics:');
+      print('Min: $minVal, Max: $maxVal, Mean: ${sum / count}');
 
-      final input = [_inputBuffer];
-      final output = [_outputBuffer];
-
-      // 모델 실행
-      _interpreter!.run(input, output);
-
-      // 원본 출력값 확인
-      print('Raw outputs: ${output[0].toString()}');
-
-      // 소프트맥스 적용
-      double maxOutput = output[0].reduce(max);
-      List<double> expOutputs =
-          output[0].map((x) => exp(x - maxOutput)).toList();
-      double sumExp = expOutputs.reduce((a, b) => a + b);
-      for (int i = 0; i < output[0].length; i++) {
-        output[0][i] = expOutputs[i] / sumExp;
-      }
-
-      print('Softmax outputs: ${output[0].toString()}');
-
-      // 결과 처리 (label.txt = [close, open]) (눈 감음 확률이 더 높은지 확인)
-      //final isEyeClosed = output[0][0] > output[0][1];
-      // 임계값 적용
-      final isEyeClosed = output[0][0] > 0.55; // 임계값 조정
-
-      if (mounted) {
-        setState(() {
-          if (isEyeClosed) {
-            drowsyFrameCount++;
-            print('Drowsy frame count: $drowsyFrameCount');
-            if (drowsyFrameCount >= drowsyFrameThreshold) {
-              _handleDrowsiness();
-            }
-          } else {
-            //drowsyFrameCount = 0;
-            drowsyFrameCount = max(0, drowsyFrameCount - 2); // 점진적 감소
-            //졸음 상태가 순간적으로 해제되었다가 다시 발생할 때 더 빠르게 감지
-          }
-        });
-      }
+      return eyeBuffer;
     } catch (e) {
-      print('Error processing frame: $e');
-      print(e.toString());
+      print('Error in eye region extraction: $e');
+      // 오류 발생 시 기본값 반환
+      return List.generate(
+        160,
+        (_) => List.generate(
+          160,
+          (_) => List.filled(3, 0.0),
+          growable: false,
+        ),
+        growable: false,
+      );
     }
+  }
+
+// 스무딩을 위한 보조 함수
+  double _interpolate(double value, double targetMin, double targetMax,
+      double sourceMin, double sourceMax) {
+    return targetMin +
+        (value - sourceMin) * (targetMax - targetMin) / (sourceMax - sourceMin);
   }
 
   // 졸음 감지 시 처리
@@ -506,5 +545,40 @@ class DrowsinessDetectionState extends State<DrowsinessDetection>
     _interpreter?.close();
     audioPlayer.dispose();
     super.dispose();
+  }
+}
+
+// 추론 결과를 보정하기 위한 이동 평균 필터 구현
+class MovingAverageFilter {
+  final int windowSize;
+  final List<List<double>> buffer;
+  int currentIndex = 0;
+  bool isFull = false;
+
+  MovingAverageFilter(this.windowSize)
+      : buffer = List.generate(windowSize, (_) => [0.0, 0.0]);
+
+  List<double> update(List<double> newValue) {
+    buffer[currentIndex] = newValue;
+    currentIndex = (currentIndex + 1) % windowSize;
+    isFull = isFull || currentIndex == 0;
+
+    if (!isFull) {
+      // 버퍼가 채워지지 않은 경우 현재까지의 평균 계산
+      List<double> sum = [0.0, 0.0];
+      for (int i = 0; i < currentIndex; i++) {
+        sum[0] += buffer[i][0];
+        sum[1] += buffer[i][1];
+      }
+      return [sum[0] / currentIndex, sum[1] / currentIndex];
+    } else {
+      // 전체 윈도우의 평균 계산
+      List<double> sum = [0.0, 0.0];
+      for (var value in buffer) {
+        sum[0] += value[0];
+        sum[1] += value[1];
+      }
+      return [sum[0] / windowSize, sum[1] / windowSize];
+    }
   }
 }
